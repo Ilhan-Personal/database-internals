@@ -1,0 +1,38 @@
+[package]
+name = "database_internals"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.8"
+
+[dev-dependencies]
+proptest = "1.0"
+criterion = "0.5"
+
+[[example]]
+name = "wal_basic"
+path = "examples/wal_basic.rs"
+
+[[example]]
+name = "btree_operations"
+path = "examples/btree_operations.rs"
+
+[[example]]
+name = "cow_concurrent"
+path = "examples/cow_concurrent.rs"
+
+[[example]]
+name = "lazy_tree_bulk"
+path = "examples/lazy_tree_bulk.rs"
+
+[[example]]
+name = "full_scenario"
+path = "examples/full_scenario.rs"
+
+[lib]
+name = "database_internals"
+path = "src/lib.rs"
