@@ -10,7 +10,7 @@ what I set out to learn, what I built, and what I took away from it.
 | #  | Experiment                                          | Topics                                  | Status         |
 |----|-----------------------------------------------------|-----------------------------------------|----------------|
 | 01 | [WAL and B-trees](experiments/01-wal-and-btrees/)   | Write-ahead log, CoW B-tree, lazy B-tree | In progress   |
-| 02 | SSTables                                            | Sorted string tables, memtables, LSM    | Planned        |
+| 02 | [SSTables](experiments/02-sstables/)                | Memtable, level-0 SSTables, LSM         | In progress    |
 
 ## Layout
 
