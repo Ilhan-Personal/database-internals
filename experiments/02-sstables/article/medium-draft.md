@@ -1,48 +1,50 @@
-# Building a Tiny LSM Storage Engine in Rust: Memtables, SSTables, Commit Logs and Tombstones
-
-*Draft for Medium. Diagrams are in `diagrams/`: upload the `.png` files where marked. The `.excalidraw` sources open at excalidraw.com if you want to edit them.*
+*Draft for Medium. Publishing notes: set the first line as Medium's Big Title (T) and the second as its Subtitle (t). Upload the PNGs from `diagrams/` where marked. Tags (5): Programming, Software Engineering, Databases, Rust, Distributed Systems. Consider submitting to a programming publication that's open to submissions.*
 
 ---
 
-I've been learning how databases work by building the pieces myself. This post covers the storage engine design behind Bigtable, LevelDB, RocksDB and Cassandra: the **log-structured merge tree**, or LSM tree.
+# Deleting a Key Made My Database Bigger
 
-By the end we'll have a small key-value store, written in Rust with only the standard library, that:
+## Building a Database from Scratch, Part 1: a tiny LSM storage engine in 350 lines of Rust
 
-- keeps recent writes sorted in memory (the **memtable**)
-- flushes them to immutable sorted files on disk (**SSTables**)
-- survives crashes, because every write goes to a **commit log** first
-- supports deletes, using **tombstones**
+In the database I just built, `delete("cherry")` makes the data on disk **bigger**.
 
-The code is on GitHub: [github.com/Ilhan-Personal/database-internals](https://github.com/Ilhan-Personal/database-internals), in `experiments/02-sstables`.
+That's not a bug. It's how the storage engines inside Cassandra, RocksDB and Bigtable work.
 
-## The big idea
+If you use any of them, this is what happens to your writes. Here's why, one piece at a time.
 
-Most of the cost of writing to disk comes from jumping around: updating a record in place means finding where it lives and rewriting it there. An LSM tree avoids that completely. It never updates anything in place:
+---
 
-1. Writes go into a sorted structure **in memory**.
-2. When that fills up, it's written to disk in one go, as a new sorted file that is never modified again.
-3. Reads check memory first, then the files from newest to oldest.
+## The one idea: never update in place
 
-Every disk write is a sequential append. The price is paid on reads, which may have to look in several places, and that's the trade-off LSM trees are built around.
+Updating a record on disk means finding where it lives and rewriting it there. All that jumping around is slow.
+
+A **log-structured merge tree** (LSM tree) never does it:
+
+- Writes go into a sorted structure **in memory**.
+- When that fills up, it's written to disk in one go, as a file that is **never modified again**.
+- Reads check memory first, then the files from newest to oldest.
+
+Every disk write is an append. Reads pay the price instead, because they may have to look in sct everal places.
 
 ![The write path](diagrams/01-write-path.png)
 
-## The memtable: a sorted map with a size counter
+---
 
-The memtable is where writes land. It needs to keep keys sorted, because when it's flushed the file must be in key order. Rust's `BTreeMap` does exactly that: it stores keys in a balanced tree, so iterating over it always visits keys from smallest to largest. With a `HashMap` you'd have to collect and sort before every flush.
+## 1. The memtable: a sorted map that knows its size
 
-```rust
-pub struct Memtable {
-    /// A `None` value marks a deleted key (a tombstone).
-    entries: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
-    /// Approximate bytes held (keys + values), used for the size threshold.
-    size_bytes: usize,
-}
-```
+Writes land in the **memtable**. It must keep keys sorted, because it becomes a sorted file later.
 
-Keys and values are raw bytes (`Vec<u8>`), compared byte by byte. That gives some surprising orders: `"Zebra"` sorts before `"apple"` because uppercase letters have smaller byte values, and `"10"` sorts before `"9"`. If you store numbers as keys, encode them **big-endian** so byte order matches numeric order.
+Rust's `BTreeMap` does exactly that. Iterating over it always visits keys from smallest to largest, so flushing it is just one loop.
 
-The memtable also tracks its approximate size, so it knows when to flush. There's a trap here: overwriting a key must *replace* the old value's bytes, not add to them, or writing the same key a thousand times would count it a thousand times:
+Keys are raw bytes, compared byte by byte, which gives some surprising orders:
+
+> `"Zebra"` sorts before `"apple"`, and `"10"` sorts before `"9"`.
+
+If you store numbers as keys, encode them big-endian so byte order matches numeric order.
+
+### The size-counting trap
+
+The memtable tracks its size so it knows when to flush. Overwriting a key must **replace** the old value's bytes, not add to them:
 
 ```rust
 fn insert(&mut self, key: Vec<u8>, value: Option<Vec<u8>>) {
@@ -57,38 +59,30 @@ fn insert(&mut self, key: Vec<u8>, value: Option<Vec<u8>>) {
 }
 ```
 
-`BTreeMap::insert` hands back the old value if there was one, which is exactly what we need. The lengths are read *before* the insert because `insert` takes ownership of `key` and `value`, and Rust won't let us use them afterwards.
+Get this wrong and writing one key a thousand times counts it a thousand times.
 
 ### When to flush
 
-The memtable is flushed when **either** of two limits is hit:
+My first idea was to flush on a timer. Bigtable flushes on size. I kept both: flush when the memtable passes a size limit **or** an interval passes, whichever comes first.
 
-- **size**: it holds more than `flush_size_bytes`
-- **time**: `flush_interval` has passed since the last flush
+---
 
-The time limit stops a quiet store from keeping data in memory indefinitely. Bigtable flushes on size only; I added the interval while experimenting.
+## 2. SSTables: write once, never touch again
 
-## SSTables: sorted, immutable files
-
-An SSTable (Sorted String Table) is just the memtable's entries written to a file in key order. I used a simple length-prefixed format, and the same format is reused for the commit log later:
+An **SSTable** (Sorted String Table) is the memtable written to a file in key order. Each record is a kind byte (put or delete), then the key and value, each with its length in front:
 
 ![Record format](diagrams/02-record-format.png)
 
-Every key and value is preceded by its length as a 4-byte little-endian `u32`. You can't use a separator like a comma or newline, because keys and values are arbitrary bytes and could contain it. A length works for any content. It also sets the limits: 4 bytes can hold numbers up to 2³² − 1, so a key or value can be at most about 4 GiB. That's far more than anyone needs; Bigtable caps row keys at 64 KB, and says 10–100 bytes is typical.
+### Four steps to write a file safely
 
-The write code uses `u32::try_from` rather than `as u32`. A plain cast would silently wrap a 5 GiB length to a smaller number and produce a corrupt file; `try_from` returns an error instead.
+A crash mid-write must never leave a half-written file that looks real:
 
-### Writing a file without ever leaving half of it behind
-
-A crash in the middle of writing an SSTable must not leave a half-written file that looks real. So the file is written in four steps:
-
-1. Write everything to `000003.tmp`.
-2. `fsync` the file, so its bytes are actually on the disk and not just in the OS cache.
-3. `rename` it to `000003.sst`. A rename is atomic: other code sees either the old name or the new one, never something in between.
-4. `fsync` the **directory**, because the rename itself is a change to the directory, and it isn't durable until that's synced too.
+1. Write everything to a temp file.
+2. `fsync` it, so the bytes are actually on disk, not just in the OS cache.
+3. `rename` it to `.sst`. A rename is atomic: you see the old name or the new one, never anything in between.
+4. `fsync` the **directory**.
 
 ```rust
-let file = writer.into_inner().map_err(|e| e.into_error())?;
 file.sync_all()?;
 fs::rename(&temp_path, path)?;
 if let Some(dir) = path.parent() {
@@ -96,60 +90,58 @@ if let Some(dir) = path.parent() {
 }
 ```
 
-Step 4 is easy to miss: without it, the file's contents can be safely on disk while its new name isn't.
+> Step 4 is easy to miss. Without it, the file's bytes can be safely on disk while its new name isn't.
 
-### Reading: newest first, first hit wins
+---
 
-Each flush creates a new file, and files can overlap: `apple` might be in `000001.sst` and again, with a newer value, in `000002.sst`. So reads check the memtable, then the SSTables from **newest to oldest**, and stop at the first one that knows the key.
+## 3. The commit log: surviving a crash
 
-Within a file, keys are sorted, so the scan can stop early: if we're looking for `banana` and reach `cherry`, `banana` isn't in this file.
+Writes that haven't been flushed live only in memory. Kill the process and they're gone, even though `put` already returned `Ok`.
 
-## Problem 1: a crash loses everything in the memtable
-
-With just a memtable and SSTables, any write that hasn't been flushed yet lives only in memory. Kill the process and it's gone, even though `put` already returned `Ok`.
-
-The fix is the oldest trick in databases: a **commit log**, also called a write-ahead log. Before a write touches the memtable, it's appended to a log file and synced to disk:
+The fix is a **commit log**, also called a write-ahead log: every write is appended to a file and synced to disk *before* it touches the memtable.
 
 ```rust
 pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> io::Result<()> {
-    self.log.append(&key, Some(&value))?;   // 1. on disk first
-    self.memtable.put(key, value);          // 2. then in memory
+    self.log.append(&key, Some(&value))?;
+    self.memtable.put(key, value);
     self.flush_if_needed()
 }
 ```
 
-On startup, the store reads the log from start to finish and replays every record into a fresh memtable, rebuilding exactly what was in memory before the crash.
+On startup, the store replays the log into a fresh memtable, rebuilding exactly what was in memory before the crash.
 
 ![Crash recovery](diagrams/04-crash-recovery.png)
 
-Three details took some thought.
+### Three crash-safety details
 
-**A partial record at the end of the log.** If the process crashes in the middle of an append, the log ends with a fragment of a record. That write was never acknowledged, because `put` hadn't returned yet, so it's safe to drop. Recovery reads records until the file ends part-way through one, then truncates the file back to the last complete record.
+**Torn writes.** A crash mid-append leaves a fragment of a record at the end of the log. That write was never acknowledged, so recovery trims the file back to the last complete record.
 
-This only handles a record that's *cut short*. If a crash left garbage bytes instead (say, a length field that reads as 3 billion), the format has no way to tell garbage from real data. Two defences help: the reader never allocates more memory than there are bytes left in the file, so a bogus length can't trigger a 4 GiB allocation; and the real fix, a checksum per record, is on the to-do list below.
+**Flush order.** The SSTable must be fully on disk before the log is emptied. Reverse the two, crash in between, and the data is gone.
 
-**When to empty the log.** Once the memtable has been flushed, its records are safely in an SSTable and the log can be emptied. The order matters: the SSTable must be fully durable (file synced, renamed, directory synced) *before* the log is cleared. If it were the other way around, a crash between the two steps would lose data.
+**Crashing between the steps anyway.** Then the log holds records that are already in the SSTable. Replaying them rebuilds the same memtable, so nothing breaks.
 
-**What if we crash between the two steps anyway?** Then the log still holds records that are already in the newest SSTable, and they get replayed into the memtable on restart. That's harmless: replaying them rebuilds the same entries, and the next flush writes them again. Making recovery safe to repeat is much easier than making every step perfectly ordered.
+> Making recovery safe to repeat is easier than making every step perfectly ordered.
 
-The same directory rule from SSTables applies here: when `commit.log` is first created, the directory is synced too, or a crash could lose the file's name along with the writes inside it.
+The cost: every `put` waits for the disk. To get around this systems use **group commit**, which batches many writes into one sync.
 
-The trade-off is speed. Syncing to disk on every write is slow, since each `put` waits for the disk. Real systems use **group commit**: they batch many writes into one sync. Bigtable does this too.
+---
 
-## Problem 2: how do you delete from a file you can't change?
+## 4. Tombstones: deleting from a file you can't change
 
-SSTables are immutable. If `cherry` is in `000001.sst`, you can't remove it from that file. And just removing it from the memtable isn't enough: the next read would miss the memtable, fall through to `000001.sst`, and find the old value again.
+![A tombstone: the record that says a key is dead, and outlives the data it buried](diagrams/tombstone.png)
 
-The answer is to write a **tombstone**, a record that says "this key is deleted." In the memtable that's a `None` value, and in a file it's a record with the delete flag and no value (the second row in the record-format diagram above).
+Here's the strange part. If `cherry` lives in an immutable file, you can't remove it from that file.
 
-The read rule doesn't change: newest to oldest, first hit wins. Now a hit can be a tombstone, and a tombstone means "stop, it's deleted":
+Removing it from the memtable isn't enough either. The next read would miss the memtable, check the file, and find the old value again.
+
+So a delete **writes a new record**, a *tombstone*, that says "this key is gone."
 
 ![Read path with a tombstone](diagrams/03-read-path.png)
 
-In Rust this fits neatly into nested `Option`s. A lookup in one table returns:
+Reads still go newest to oldest, and the first hit wins. A tombstone is a hit that says "stop, it's deleted." In Rust that fits into nested `Option`s:
 
-- `None`: this table has never heard of the key, so keep looking
-- `Some(None)`: this table has a tombstone, so the key is deleted and we stop
+- `None`: this table has never seen the key, so keep looking
+- `Some(None)`: tombstone, the key is deleted
 - `Some(Some(value))`: found it
 
 ```rust
@@ -166,38 +158,41 @@ pub fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
 }
 ```
 
-There's a cost: the old value is still on disk, taking up space, and so is the tombstone. Neither goes away until **compaction** merges the files and drops both. That's the next thing I'll build.
+And that's the answer to the title. After a delete, the old value **and** the tombstone are both on disk. Neither goes away until **compaction** merges the files.
 
-## What Rust taught me along the way
+---
 
-**Borrowing makes flush ordering explicit.** The memtable's iterator hands out slices that point into the memtable's own memory. While those slices exist, the borrow checker won't let you replace or drop the memtable. So the flush has to be written in the safe order: write the file from the memtable, *then* replace it. A failed write leaves the data in memory, and the compiler enforces it.
+## Proof it works
 
-**`&[u8]` over `&Vec<u8>`.** The SSTable writer accepts byte slices, not `Vec`s, so it works with any bytes: memtable contents, literals, or buffers read from other files (which compaction will need). Converting with `.as_slice()` is free; it just lends out the pointer and length.
-
-## Where it stands, and what's next
-
-Run `cargo run -p sstables` and the demo shows each piece working:
+The demo runs every piece, including a simulated crash:
 
 ```
 after crossing 32 bytes (expect 1 file): ["000001.sst"]
-after waiting past 500ms (expect 2 files): ["000001.sst", "000002.sst"]
-get apple (expect newer "red"): Some("red")
 get cherry after delete (expect None, though 000001.sst still has it): None
 simulated a crash mid-append: commit.log grew from 36 to 39 bytes
 after reopening, commit.log is back to 36 bytes
 get elderberry (expect "purple", replayed from the log): Some("purple")
 ```
 
-What this engine still doesn't do, roughly in the order I plan to tackle it:
+The code is std-only Rust: [github.com/Ilhan-Personal/database-internals](https://github.com/Ilhan-Personal/database-internals), in `experiments/02-sstables`.
 
-- **Every read scans whole files.** Bigtable splits each SSTable into 64 KB blocks with an index at the end of the file, so a lookup costs one disk seek.
-- **Files pile up forever.** Compaction merges them, drops overwritten values, and finally removes tombstones.
-- **Missing keys are expensive.** A lookup for a key that doesn't exist reads every file. **Bloom filters** let most of those skip the disk.
-- **No checksums.** A corrupted byte in the log or a file wouldn't be detected.
-- **Flushing blocks writes.** Bigtable freezes the full memtable and flushes it in the background while a new one takes writes.
+---
 
-## References
+## Next in the series
 
-- Chang et al., [*Bigtable: A Distributed Storage System for Structured Data*](https://research.google.com/archive/bigtable-osdi06.pdf) (OSDI 2006), especially sections 4, 5.3, 5.4 and 6
-- O'Neil et al., *The Log-Structured Merge-Tree (LSM-Tree)* (Acta Informatica, 1996)
-- Alex Petrov, *Database Internals* (O'Reilly, 2019)
+Part 2 deals with the leftovers: **compaction**, which merges the files and finally clears out those tombstones. Follow along if you want to see the database get smaller again.
+
+After that:
+
+- **Block index:** stop scanning whole files. Bigtable uses 64 KB blocks plus an index, so a lookup costs one disk seek.
+- **Bloom filters:** skip files that definitely don't have the key.
+- **Checksums:** detect corrupted bytes, not just cut-off ones.
+
+
+---
+
+**References**
+
+- Chang et al., [*Bigtable: A Distributed Storage System for Structured Data*](https://research.google.com/archive/bigtable-osdi06.pdf), OSDI 2006
+- O'Neil et al., *The Log-Structured Merge-Tree (LSM-Tree)*, Acta Informatica, 1996
+- Alex Petrov, *Database Internals*, O'Reilly, 2019
