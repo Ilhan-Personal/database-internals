@@ -1,5 +1,3 @@
-//! WAL + storage end-to-end: log a few ops, replay, read back state.
-
 use database_internals::storage::InMemoryStorage;
 use database_internals::StorageBackend;
 use database_internals::wal::{recover_from_log, WriteAheadLog};

@@ -1,20 +1,7 @@
-//! Write Ahead Logging (WAL) system.
-//!
-//! WAL provides durability by logging operations before executing them.
-//! If the system crashes, the log can be replayed to recover the last consistent state.
-//!
-//! # Key Concepts
-//!
-//! - **Log Entry**: Each operation (insert, delete) is serialized and appended to the log
-//! - **Durability**: Log is flushed before returning to client (operation is durable immediately)
-//! - **Recovery**: On startup, scan log and replay entries to reconstruct state
-//! - **Checksum**: Each log entry includes a checksum to detect corruption
-
 use crate::wal::LogEntry;
 use std::fs::File;
 use std::io::Write;
 
-// this is so that we can change the storage backend later
 pub struct WriteAheadLog {
     file_handle: File,
     entries: Vec<LogEntry>,
@@ -38,7 +25,6 @@ impl WriteAheadLog {
         self.file_handle.sync_all().unwrap();
     }
 }
-
 
 #[cfg(test)]
 mod tests {

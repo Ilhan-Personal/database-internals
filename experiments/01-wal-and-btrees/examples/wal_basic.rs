@@ -1,5 +1,3 @@
-//! Minimal WAL demo: append operations and replay into storage.
-
 use database_internals::storage::InMemoryStorage;
 use database_internals::StorageBackend;
 use database_internals::wal::{recover_from_log, WriteAheadLog};

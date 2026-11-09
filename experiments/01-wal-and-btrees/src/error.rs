@@ -1,11 +1,7 @@
-//! Error types for the database engine.
-
 use thiserror::Error;
 
-/// Result type for database operations.
 pub type Result<T> = std::result::Result<T, DbError>;
 
-/// Database errors.
 #[derive(Error, Debug)]
 pub enum DbError {
     #[error("Key not found")]

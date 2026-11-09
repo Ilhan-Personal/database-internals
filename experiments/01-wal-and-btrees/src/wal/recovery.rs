@@ -1,12 +1,7 @@
-//! WAL recovery logic.
-
 use crate::Result;
 use crate::storage::StorageBackend;
 use super::LogEntry;
 
-/// Recover database state from WAL log entries.
-///
-/// Replays all log entries in order to reconstruct the last consistent state.
 pub fn recover_from_log(storage: &dyn StorageBackend, entries: &[LogEntry]) -> Result<()> {
     for entry in entries {
         match entry.op_type.as_str() {
@@ -19,7 +14,6 @@ pub fn recover_from_log(storage: &dyn StorageBackend, entries: &[LogEntry]) -> R
                 storage.delete(&entry.key)?;
             }
             _ => {
-                // Unknown operation type, skip
             }
         }
     }
@@ -36,7 +30,6 @@ mod tests {
         let storage = InMemoryStorage::new();
         let entries = vec![];
         recover_from_log(&storage, &entries).unwrap();
-        // Should succeed without errors
     }
 
     #[test]

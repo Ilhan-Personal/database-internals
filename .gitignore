@@ -3,5 +3,4 @@ target/
 .DS_Store
 .claude/settings.local.json
 
-# ~/.gitignore_global ignores /docs/; this repo tracks it
 !/docs/

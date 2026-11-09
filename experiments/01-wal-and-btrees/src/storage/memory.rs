@@ -1,5 +1,3 @@
-//! In-memory storage implementation.
-
 use std::sync::{Arc, RwLock};
 use std::collections::BTreeMap;
 use crate::Result;
@@ -11,7 +9,6 @@ pub struct InMemoryStorage {
 }
 
 impl InMemoryStorage {
-    /// Create a new empty in-memory storage.
     pub fn new() -> Self {
         InMemoryStorage {
             data: Arc::new(RwLock::new(BTreeMap::new())),

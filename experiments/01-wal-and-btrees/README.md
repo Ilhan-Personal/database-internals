@@ -22,8 +22,6 @@ cargo test -p database_internals
 cargo run -p database_internals --example wal_basic
 ```
 
-Plans and brainstorms are in [`docs/`](docs/).
-
 ## Results
 
 _TBD_

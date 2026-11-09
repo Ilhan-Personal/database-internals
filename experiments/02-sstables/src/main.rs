@@ -1,12 +1,14 @@
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use sstables::lsm::LEVEL0_DIR;
+use sstables::lsm::{COMMIT_LOG_FILE, LEVEL0_DIR};
 use sstables::memtable::Memtable;
 use sstables::{Config, Lsm};
+
+const TORN_WRITE: [u8; 3] = [0, 9, 0];
 
 fn main() -> io::Result<()> {
     memtable_demo();
@@ -26,12 +28,20 @@ fn memtable_demo() {
     mem.put(b"apple".to_vec(), b"red".to_vec());
     println!("size after overwriting apple (expect 2 bytes less): {} bytes", mem.size_bytes());
 
-    println!("get apple: {:?}", mem.get(b"apple").map(String::from_utf8_lossy));
-    println!("get durian: {:?}", mem.get(b"durian").map(String::from_utf8_lossy));
+    mem.delete(b"banana".to_vec());
+    println!("size after deleting banana (expect 6 bytes less): {} bytes", mem.size_bytes());
+
+    println!("get apple: {:?}", mem.get(b"apple").map(|v| v.map(String::from_utf8_lossy)));
+    println!("get banana (expect Some(None), a tombstone): {:?}", mem.get(b"banana"));
+    println!("get durian (expect None): {:?}", mem.get(b"durian"));
 
     println!("in key order (expect apple, banana, cherry):");
     for (key, value) in mem.iter() {
-        println!("  {} = {}", String::from_utf8_lossy(key), String::from_utf8_lossy(value));
+        println!(
+            "  {} = {:?}",
+            String::from_utf8_lossy(key),
+            value.map(String::from_utf8_lossy)
+        );
     }
 }
 
@@ -63,9 +73,25 @@ fn lsm_demo() -> io::Result<()> {
     println!("get cherry (from first file): {:?}", as_text(db.get(b"cherry")?));
     println!("get durian (expect None): {:?}", as_text(db.get(b"durian")?));
 
+    println!("\n== deletes");
+    db.delete(b"cherry".to_vec())?;
+    println!("get cherry after delete (expect None, though 000001.sst still has it): {:?}", as_text(db.get(b"cherry")?));
+
+    println!("\n== crash recovery");
+    db.put(b"elderberry".to_vec(), b"purple".to_vec())?;
+    println!("memtable not flushed yet, files: {:?}", level0_files(&dir)?);
     drop(db);
+
+    let log_path = dir.join(COMMIT_LOG_FILE);
+    let log_len = fs::metadata(&log_path)?.len();
+    OpenOptions::new().append(true).open(&log_path)?.write_all(&TORN_WRITE)?;
+    println!("simulated a crash mid-append: commit.log grew from {log_len} to {} bytes", fs::metadata(&log_path)?.len());
+
     let db = Lsm::open(&dir, config())?;
-    println!("after reopening, get banana: {:?}", as_text(db.get(b"banana")?));
+    println!("after reopening, commit.log is back to {} bytes", fs::metadata(&log_path)?.len());
+    println!("get elderberry (expect \"purple\", replayed from the log): {:?}", as_text(db.get(b"elderberry")?));
+    println!("get cherry (expect None, tombstone replayed from the log): {:?}", as_text(db.get(b"cherry")?));
+    println!("get banana (from 000001.sst): {:?}", as_text(db.get(b"banana")?));
     Ok(())
 }
 
