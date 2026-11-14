@@ -3,6 +3,7 @@ use std::io::{self, Read, Write};
 const KIND_PUT: u8 = 0;
 const KIND_DELETE: u8 = 1;
 
+const RECORD_LEN_BYTES: usize = 4;
 pub type Record = (Vec<u8>, Option<Vec<u8>>);
 
 pub fn write(writer: &mut impl Write, key: &[u8], value: Option<&[u8]>) -> io::Result<()> {
@@ -48,12 +49,12 @@ fn write_bytes(writer: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
 }
 
 fn read_bytes(reader: &mut impl Read) -> io::Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
+    let mut len_buf = [0u8; RECORD_LEN_BYTES];
     reader.read_exact(&mut len_buf)?;
-    let len = u64::from(u32::from_le_bytes(len_buf));
+    let len = u32::from_le_bytes(len_buf);
     let mut bytes = Vec::new();
-    reader.take(len).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 != len {
+    reader.take(len as u64).read_to_end(&mut bytes)?;
+    if bytes.len() != len as usize {
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "record cut off"));
     }
     Ok(bytes)
